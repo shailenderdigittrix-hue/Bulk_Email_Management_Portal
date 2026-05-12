@@ -1,0 +1,477 @@
+================================================================================
+        BULK EMAIL MANAGEMENT PORTAL - TECHNICAL ARCHITECTURE DOCUMENT
+================================================================================
+
+
+1. SYSTEM OVERVIEW
+================================================================================
+
+The Bulk Email Management Portal is a PHP-based web application designed to
+manage bulk email campaigns. It provides functionality for contact management,
+email template creation, campaign scheduling, and real-time delivery tracking.
+
+1.1 Core Capabilities
+----------------------
+  - Contact import via CSV
+  - Dynamic email template management with variable substitution
+  - Campaign creation with immediate or scheduled sending
+  - Background email processing with retry logic
+  - Real-time campaign statistics via AJAX polling
+  - Email delivery logging and tracking
+
+
+2. ARCHITECTURE PATTERN
+================================================================================
+
+Pattern: MVC-inspired procedural architecture with separation of concerns
+
+2.1 Layers
+-----------
+  - Presentation Layer     : PHP pages with embedded HTML/Bootstrap UI
+  - Business Logic Layer   : functions.php utility functions
+  - Data Access Layer      : PDO-based database interactions
+  - Background Processing  : Cron-based email worker
+
+
+3. TECHNOLOGY STACK
+================================================================================
+
+  Component              Technology         Version
+  ---------------------  -----------------  ----------
+  Backend Language       PHP                8.3+
+  Database               MySQL              5.7+
+  Database Driver        PDO                Native
+  Email Library          PHPMailer          ^7.0
+  Frontend Framework     Bootstrap          5.3.3
+  JavaScript Library     jQuery             3.7.1
+  Dependency Manager     Composer           Latest
+  Web Server             MAMP (Apache)      Latest
+
+
+4. DATABASE SCHEMA
+================================================================================
+
+4.1 Entity Relationship Diagram (Conceptual)
+---------------------------------------------
+
+  contacts (1) ----< (M) campaign_recipients (M) >---- (1) campaigns
+                                                              |
+                                                              | (1)
+                                                              v
+                                                        email_templates
+  email_logs (M) >---- (1) campaigns
+
+
+4.2 Table Definitions
+----------------------
+
+  TABLE: contacts
+  Purpose: Stores all imported contact records
+
+  Column        Type          Constraints                    Description
+  ------------  ------------  -----------------------------  ----------------------
+  id            INT           PRIMARY KEY, AUTO_INCREMENT    Unique contact ID
+  name          VARCHAR(255)                                 Contact full name
+  email         VARCHAR(255)  UNIQUE                         Contact email address
+  company       VARCHAR(255)                                 Company name
+  created_at    TIMESTAMP     DEFAULT CURRENT_TIMESTAMP      Record creation time
+
+  Index: UNIQUE on email
+
+  --------------------------------------------------------------------------
+
+  TABLE: email_templates
+  Purpose: Stores reusable email templates with variable placeholders
+
+  Column        Type          Constraints                    Description
+  ------------  ------------  -----------------------------  ----------------------
+  id            INT           PRIMARY KEY, AUTO_INCREMENT    Template identifier
+  title         VARCHAR(255)                                 Template name
+  subject       VARCHAR(255)                                 Email subject line
+  body          LONGTEXT                                     HTML body with vars
+  created_at    TIMESTAMP     DEFAULT CURRENT_TIMESTAMP      Creation time
+
+  Supported Variables: {{name}}, {{company}}, {{email}}
+
+  --------------------------------------------------------------------------
+
+  TABLE: campaigns
+  Purpose: Stores campaign metadata and status
+
+  Column        Type          Constraints                    Description
+  ------------  ------------  -----------------------------  ----------------------
+  id            INT           PRIMARY KEY, AUTO_INCREMENT    Campaign identifier
+  name          VARCHAR(255)                                 Campaign name
+  template_id   INT           FK -> email_templates.id       Associated template
+  status        ENUM          pending/processing/completed   Campaign state
+  send_type     VARCHAR(50)   now / scheduled                Send mode
+  scheduled_at  DATETIME      NULL                           Scheduled send time
+  created_at    TIMESTAMP     DEFAULT CURRENT_TIMESTAMP      Creation time
+
+  Status Flow: pending --> processing --> completed
+
+  --------------------------------------------------------------------------
+
+  TABLE: campaign_recipients
+  Purpose: Tracks per-recipient email delivery status
+
+  Column        Type          Constraints                    Description
+  ------------  ------------  -----------------------------  ----------------------
+  id            INT           PRIMARY KEY, AUTO_INCREMENT    Recipient record ID
+  campaign_id   INT           FK -> campaigns.id             Parent campaign
+  contact_id    INT           FK -> contacts.id              Target contact
+  email         VARCHAR(255)                                 Recipient email
+  status        ENUM          pending / sent / failed        Delivery status
+  retry_count   INT           DEFAULT 0                      Failed attempt count
+  sent_at       DATETIME      NULL                           Successful send time
+
+  Index: Composite on (campaign_id, status)
+
+  --------------------------------------------------------------------------
+
+  TABLE: email_logs
+  Purpose: Audit trail for all email operations
+
+  Column        Type          Constraints                    Description
+  ------------  ------------  -----------------------------  ----------------------
+  id            INT           PRIMARY KEY, AUTO_INCREMENT    Log entry ID
+  campaign_id   INT           FK -> campaigns.id             Associated campaign
+  email         VARCHAR(255)                                 Target email address
+  status        VARCHAR(50)                                  Operation status
+  message       TEXT                                         Status/error message
+  created_at    TIMESTAMP     DEFAULT CURRENT_TIMESTAMP      Log timestamp
+
+
+5. APPLICATION COMPONENTS
+================================================================================
+
+5.1 Frontend Pages
+-------------------
+
+  index.php (Dashboard)
+  ----------------------
+  Purpose  : Main landing page with system overview
+  Features :
+    - Dashboard cards (total contacts, templates, campaigns)
+    - Paginated contacts table
+    - Real-time campaign stats via AJAX
+  Key Logic:
+    - Aggregation queries for dashboard metrics
+    - Pagination with LIMIT/OFFSET
+    - jQuery polling every 3 seconds to api/campaign_stats.php
+
+  --------------------------------------------------------------------------
+
+  upload_contacts.php (Contact Import)
+  --------------------------------------
+  Purpose  : CSV file upload and contact import
+  Features :
+    - CSV parsing with header skip
+    - Email validation via FILTER_VALIDATE_EMAIL
+    - Duplicate detection by email
+  CSV Format:
+    name,email,company
+    John Doe,john@example.com,ABC Corp
+  Error Handling: Skips invalid emails, prevents duplicates
+
+  --------------------------------------------------------------------------
+
+  templates.php (Template Management)
+  -------------------------------------
+  Purpose  : Create and list email templates
+  Features :
+    - WYSIWYG-ready textarea for HTML body
+    - Variable placeholder support ({{name}}, {{company}}, {{email}})
+    - Paginated template list
+    - Edit/Delete actions
+  Validation: All fields required
+
+  --------------------------------------------------------------------------
+
+  campaigns.php (Campaign Management)
+  -------------------------------------
+  Purpose  : Create and monitor campaigns
+  Features :
+    - Campaign creation form with template selection
+    - Send type: Immediate (now) or Scheduled (scheduled)
+    - Dynamic schedule input (datetime-local)
+    - Campaign list with status badges
+    - "Queue Emails" action for pending campaigns
+    - Auto-refresh worker via AJAX (every 10 seconds)
+  Status Indicators:
+    - Pending (yellow), Processing (blue), Completed (green)
+
+  --------------------------------------------------------------------------
+
+  send_campaign.php (Campaign Queue Builder)
+  -------------------------------------------
+  Purpose  : Populate campaign_recipients table
+  Workflow :
+    1. Validate campaign exists and is not already processed
+    2. Check scheduled time (if applicable)
+    3. Fetch all contacts
+    4. Prevent duplicate recipient records
+    5. Insert pending recipients
+    6. Log queue operations
+    7. Update campaign status to processing
+  Safeguards: Duplicate prevention, status validation
+
+
+5.2 Backend Components
+-----------------------
+
+  config/database.php (Database Connection)
+  -------------------------------------------
+  Purpose       : PDO connection singleton
+  Configuration :
+    - Windows : localhost:3306, user: root, password: (empty)
+    - macOS   : localhost:8889, user: root, password: root
+  Settings      : UTF-8 charset, exception error mode
+
+  --------------------------------------------------------------------------
+
+  functions.php (Utility Library)
+  ---------------------------------
+  Core helper functions:
+
+  Function                              Purpose
+  ------------------------------------  ------------------------------------
+  clean($data)                          Sanitize input with htmlspecialchars
+  isValidEmail($email)                  Email validation
+  replaceTemplateVariables($body, $c)   Template variable substitution
+  redirect($url)                        HTTP redirect helper
+  setFlashMessage($type, $message)      Session-based flash messages
+  displayFlashMessage()                 Render flash messages
+  randomString($length)                 Generate random strings
+  formatDate($date)                     Date formatting helper
+
+  --------------------------------------------------------------------------
+
+  cron/send_emails.php (Email Worker)
+  -------------------------------------
+  Purpose   : Background email processing daemon
+  Execution : Cron job or AJAX polling (every 10 seconds)
+
+  Processing Logic:
+    1. Query  : Fetch up to 3 recipients where:
+                  - Status is pending or failed
+                  - Retry count < 3
+                  - Campaign is due (for scheduled campaigns)
+    2. Lock   : Update status to processing (prevent race conditions)
+    3. Send   : Use PHPMailer with Gmail SMTP
+    4. Success: Mark as sent, log success
+    5. Failure: Increment retry count, mark as failed after 3 attempts
+    6. Check  : Mark campaign as completed when all emails sent
+
+  Concurrency Control: Row-level locking via status update
+
+  PHPMailer Configuration:
+    Host       : smtp.gmail.com
+    Port       : 587
+    Encryption : STARTTLS
+    Auth       : Gmail credentials (user-provided)
+
+  --------------------------------------------------------------------------
+
+  api/campaign_stats.php (Stats API)
+  ------------------------------------
+  Purpose         : Real-time campaign statistics
+  Response Format : JSON
+    {
+      "sent"    : 150,
+      "pending" : 25,
+      "failed"  : 5
+    }
+  Query: Aggregation on campaign_recipients by status
+
+
+6. DATA FLOW DIAGRAMS
+================================================================================
+
+6.1 Campaign Creation Flow
+---------------------------
+
+  User --> campaigns.php (Create Form)
+    |
+    v
+  POST /campaigns.php
+    |
+    v
+  INSERT INTO campaigns
+  (status = processing if now, pending if scheduled)
+    |
+    v
+  Redirect to campaigns.php
+    |
+    v
+  User clicks "Queue Emails"
+    |
+    v
+  send_campaign.php
+    |
+    v
+  INSERT INTO campaign_recipients (all contacts)
+    |
+    v
+  UPDATE campaigns SET status = processing
+    |
+    v
+  Redirect to campaigns.php
+
+
+6.2 Email Sending Flow
+-----------------------
+
+  Cron/AJAX Trigger --> cron/send_emails.php
+    |
+    v
+  SELECT pending/failed recipients (LIMIT 3)
+    |
+    v
+  FOR EACH recipient:
+    |
+    v
+    UPDATE status = processing (lock)
+    |
+    v
+    PHPMailer --> Gmail SMTP
+    |
+    v
+    Success?
+      |-- YES --> UPDATE status = sent, sent_at = NOW()
+      |           INSERT INTO email_logs (status = success)
+      |
+      |-- NO  --> UPDATE retry_count++
+                  IF retry_count >= 3: UPDATE status = failed
+                  INSERT INTO email_logs (status = failed)
+    |
+    v
+  Check if all recipients sent
+    |
+    v
+  YES --> UPDATE campaigns SET status = completed
+
+
+6.3 Real-Time Stats Flow
+-------------------------
+
+  index.php (Dashboard)
+    |
+    v
+  jQuery setInterval (every 3 seconds)
+    |
+    v
+  AJAX GET /api/campaign_stats.php?campaign_id=1
+    |
+    v
+  SELECT SUM(sent), SUM(pending), SUM(failed)
+    |
+    v
+  JSON Response
+    |
+    v
+  Update DOM (#sent, #pending, #failed)
+
+
+7. SECURITY CONSIDERATIONS
+================================================================================
+
+7.1 Implemented Measures
+--------------------------
+  - SQL Injection Prevention : Prepared statements with PDO
+  - XSS Prevention           : htmlspecialchars() on all output
+  - Email Validation         : FILTER_VALIDATE_EMAIL filter
+  - Session Management       : Flash messages via PHP sessions
+  - CSRF Protection          : NOT IMPLEMENTED (see recommendations)
+
+7.2 Recommendations
+--------------------
+  1. Add CSRF tokens to all forms
+  2. Implement authentication (currently no login system)
+  3. Use environment variables for database credentials
+  4. Enable HTTPS for production
+  5. Add rate limiting on email sending
+  6. Sanitize CSV uploads (prevent CSV injection)
+  7. Use Gmail App Passwords instead of plain passwords
+
+
+8. PERFORMANCE OPTIMIZATION
+================================================================================
+
+8.1 Current Optimizations
+--------------------------
+  - Pagination       : Limits query results (5 per page)
+  - Batch Processing : Processes 3 emails per cron run
+  - Indexed Queries  : UNIQUE index on contacts.email
+
+8.2 Scalability Recommendations
+---------------------------------
+  1. Queue System      : Replace cron with Redis/RabbitMQ
+  2. Database Indexing : Add composite indexes on (campaign_id, status)
+  3. Connection Pool   : Use persistent PDO connections
+  4. Caching           : Cache dashboard metrics with Redis
+  5. Async Processing  : Use PHP-FPM with background workers
+  6. CDN               : Serve Bootstrap/jQuery from CDN (already done)
+
+
+9. ERROR HANDLING & LOGGING
+================================================================================
+
+9.1 Error Handling Strategy
+-----------------------------
+  - Database Errors : Try-catch blocks with PDO exceptions
+  - Email Failures  : Logged to email_logs table
+  - Retry Logic     : Up to 3 attempts per recipient
+  - User Feedback   : Session-based flash messages
+
+9.2 Logging Mechanisms
+-----------------------
+  - email_logs Table : Audit trail for all email operations
+  - Console Output   : echo statements in cron worker
+  - PHP Error Logs   : Disabled in production (commented out)
+
+
+10. DEPLOYMENT GUIDE
+================================================================================
+
+10.1 Prerequisites
+-------------------
+  - PHP 7.4+
+  - MySQL 5.7+
+  - Composer
+  - MAMP / XAMPP / LAMP stack
+
+10.2 Installation Steps
+------------------------
+
+  Step 1: Extract Project
+    cd /Applications/MAMP/htdocs/
+    (Extract project files here)
+
+  Step 2: Install Dependencies
+    cd my_php_project
+    composer install
+
+  Step 3: Create Database
+    mysql -u root -p < schema.sql
+
+  Step 4: Configure Database
+    Edit config/database.php:
+      $host     = "localhost";
+      $port     = "8889";       // 3306 for Windows
+      $dbname   = "bulk_email_portal";
+      $username = "root";
+      $password = "root";       // Empty for Windows
+
+  Step 5: Configure Email
+    Edit cron/send_emails.php:
+      $mail->Username = 'your_email@gmail.com';
+      $mail->Password = 'your_app_password';
+
+  Step 6: Set Up Cron Job (Production)
+    */1 * * * * php /path/to/cron/send_emails.php >> /var/log/email_worker.log 2>&1
+
+  Step 7: Start Server
+    Start Apache and MySQL via MAMP
+    Access: http://localhost:8888/my_php_project/
+
